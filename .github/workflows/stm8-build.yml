@@ -1,0 +1,47 @@
+name: STM8 Siren Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - stm8-siren-build-20260805
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore project
+        run: |
+          cat stm8_ci/payload.part* > /tmp/stm8_payload.b64
+          base64 -d /tmp/stm8_payload.b64 > /tmp/stm8_project.tar.gz
+          tar -xzf /tmp/stm8_project.tar.gz
+
+      - name: Install SDCC STM8 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sdcc sdcc-libraries python3 zip
+          sdcc --version
+
+      - name: Build all images
+        run: |
+          chmod +x tools/build_all.sh
+          ./tools/build_all.sh 2>&1 | tee build.log
+
+      - name: Package outputs
+        if: always()
+        run: |
+          mkdir -p package
+          cp -r dist package/ 2>/dev/null || true
+          cp build.log package/ 2>/dev/null || true
+          cp -r src include tools platformio.ini package/
+          cp PINOUT.md README.md package/ 2>/dev/null || true
+          zip -r stm8_siren_firmware.zip package
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stm8-siren-firmware
+          path: stm8_siren_firmware.zip
+          if-no-files-found: error
