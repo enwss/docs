@@ -20,6 +20,7 @@ jobs:
           cat stm8_ci/payload.part* > /tmp/stm8_payload.b64
           base64 -d /tmp/stm8_payload.b64 > /tmp/stm8_project.tar.gz
           tar -xzf /tmp/stm8_project.tar.gz
+          sed -i 's/--max-allocs-per-node 100000/--max-allocs-per-node 10000/' tools/build_all.sh
 
       - name: Install SDCC STM8 toolchain
         run: |
