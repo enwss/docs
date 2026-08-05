@@ -1,0 +1,32 @@
+name: STM8 SDCC Toolchain Build
+
+on:
+  push:
+    branches:
+      - stm8-toolchain-build-20260806
+
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Download official SDCC 4.5.0 GNU/Linux binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/sdcc-toolchain
+          wget -q --show-progress \
+            'https://downloads.sourceforge.net/project/sdcc/sdcc-linux-amd64/4.5.0/sdcc-4.5.0-amd64-unknown-linux2.5.tar.bz2' \
+            -O /tmp/sdcc.tar.bz2
+          tar -xjf /tmp/sdcc.tar.bz2 -C /tmp/sdcc-toolchain --strip-components=1
+          /tmp/sdcc-toolchain/bin/sdcc --version
+          tar -C /tmp -czf /tmp/sdcc-toolchain-linux-x64.tar.gz sdcc-toolchain
+
+      - name: Upload SDCC toolchain
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdcc-toolchain-linux-x64
+          path: /tmp/sdcc-toolchain-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 1
