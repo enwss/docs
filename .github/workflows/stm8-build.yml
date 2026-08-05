@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - stm8-siren-build-20260805
+  pull_request:
+    branches:
+      - main
 
 jobs:
   build:
