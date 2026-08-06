@@ -1,0 +1,118 @@
+name: STM8 Siren Fix7 Final Build
+
+on:
+  push:
+    branches:
+      - ci-stm8-siren-fix7
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p project
+          base64 -d tmp_stm8_fix7/source_payload.b64 | tar -xz -C project
+
+      - name: Install SDCC
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sdcc
+
+      - name: Compile and validate final firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/project"
+          BUILD="$GITHUB_WORKSPACE/build"
+          OUT="$GITHUB_WORKSPACE/deliverable/STM8S103F3P6TR_firmware_full_fix7"
+          mkdir -p "$BUILD" "$OUT/src"
+          cd "$BUILD"
+
+          CFLAGS="-mstm8 --std-c99 --opt-code-size --max-allocs-per-node 10000 -DBUILD_VARIANT=3 -I$ROOT/src"
+          : > compile.stdout.txt
+          : > compile.stderr.txt
+          for src in main audio profiles_data; do
+            sdcc $CFLAGS -c "$ROOT/src/$src.c" -o "$src.rel" >>compile.stdout.txt 2>>compile.stderr.txt
+          done
+          sdcc -mstm8 --opt-code-size --code-loc 0x8000 --data-loc 0x0001 main.rel audio.rel profiles_data.rel -o firmware_full.hex >>compile.stdout.txt 2>>compile.stderr.txt
+
+          cp firmware_full.hex firmware_full.map compile.stdout.txt compile.stderr.txt "$OUT/"
+          cp "$ROOT/src/"* "$OUT/src/"
+          sdcc --version > "$OUT/SDCC_VERSION.txt" 2>&1
+          export OUT ROOT
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, os, re
+          out=Path(os.environ['OUT']); root=Path(os.environ['ROOT']); hx=out/'firmware_full.hex'
+          mem={}; upper=0; eof=False; records=0
+          for lineno,line in enumerate(hx.read_text().splitlines(),1):
+              line=line.strip()
+              if not line: continue
+              raw=bytes.fromhex(line[1:])
+              if not line.startswith(':') or sum(raw)&0xFF: raise SystemExit(f'HEX failure line {lineno}')
+              n=raw[0]; addr=(raw[1]<<8)|raw[2]; typ=raw[3]; data=raw[4:4+n]; records+=1
+              if typ==0:
+                  for i,b in enumerate(data): mem[upper+addr+i]=b
+              elif typ==4: upper=int.from_bytes(data,'big')<<16
+              elif typ==1: eof=True; break
+          if not mem or not eof: raise SystemExit('HEX data/EOF missing')
+          lo=min(mem); hi=max(mem); span=hi-lo+1
+          if lo!=0x8000 or hi>0x9FFF: raise SystemExit(f'Flash invalid 0x{lo:X}-0x{hi:X}')
+          vec=0x803C
+          target=(mem.get(vec+1,0)<<16)|(mem.get(vec+2,0)<<8)|mem.get(vec+3,0)
+          if mem.get(vec)!=0x82 or not 0x8000<=target<=hi: raise SystemExit('IRQ13 vector invalid')
+          main=(root/'src/main.c').read_text(); audio=(root/'src/audio.c').read_text(); hdr=(root/'src/audio.h').read_text(); combined=main+audio+hdr
+          expected={'CODE_KISA':'0x03U','CODE_HORN':'0x1DU','CODE_BASS':'0x07U','CODE_PHSR':'0x1BU','CODE_WAWA':'0x1CU','CODE_YELP':'0x19U','CODE_HILO':'0x1AU','CODE_WAIL1':'0x0FU','CODE_WAIL2':'0x18U','CODE_STOP':'0x13U','CODE_A':'0x06U','CODE_B':'0x09U','CODE_DIS':'0x05U','CODE_RIO':'0x0EU'}
+          for k,v in expected.items():
+              if not re.search(rf'#define\s+{k}\s+{v}\b',main): raise SystemExit('Mapping '+k)
+          def table(name):
+              m=re.search(rf'{name}\[22\]\s*=\s*\{{(.*?)\}};',audio,re.S)
+              return [int(x) for x in re.findall(r'(\d+)U',m.group(1))] if m else []
+          h1=table('horn1_segments'); h2=table('horn2_segments')
+          if len(h1)!=22 or sum(h1)!=16042: raise SystemExit('BANK1 table')
+          if len(h2)!=22 or sum(h2)!=34422: raise SystemExit('BANK2 table')
+          for token in ['audio_horn_segments[next]','start_horn_segments(horn1_segments,22U,1U)','start_horn_segments(horn2_segments,22U,1U)','DIRECT_SPEED_NUM 125U','case SID_WAWA: return 5088U','case SID_HILO: return 3240U','if(panel_enabled) relay_a^=1U','if(panel_enabled) relay_b^=1U','relay_a=0U; relay_b=0U']:
+              if token not in combined: raise SystemExit('Missing '+token)
+          for token in ['horn1_bits','horn2_bits','audio_horn_phase','audio_horn_step','start_horn_bits']:
+              if token in combined: raise SystemExit('Old '+token)
+          maptext=(out/'firmware_full.map').read_text(errors='replace')
+          def area(n):
+              m=re.search(rf'^{n}\s+[0-9A-F]+\s+[0-9A-F]+\s+=\s+(\d+)\.',maptext,re.M); return int(m.group(1)) if m else 0
+          ram=area('DATA')+area('SSEG'); sha=hashlib.sha256(hx.read_bytes()).hexdigest(); warnings=(out/'compile.stderr.txt').read_text().strip()
+          report=f'''SDCC REAL BUILD RESULT - FIX7 FINAL
+Flash start       : 0x{lo:04X}
+Flash end         : 0x{hi:04X}
+Flash span        : {span} bytes / 8192 bytes
+Flash free        : {8192-span} bytes
+Static RAM        : {ram} bytes / 1024 bytes
+TIM2 IRQ13 vector : 0x{vec:04X} -> 0x{target:06X} PASS
+BANK1 horn_orig    : 8.021 ms / HIGH start / 22 edges PASS
+BANK2 bank2horn    : 17.211 ms / HIGH start / 22 edges PASS
+Button mapping     : PASS
+WAWA/HILO speed    : 125 percent PASS
+A/B panel lock     : PASS
+Compiler stderr    : {'EMPTY' if not warnings else 'SEE compile.stderr.txt'}
+HEX records        : {records}
+HEX checksum/EOF   : PASS
+SHA-256            : {sha}
+'''
+          (out/'BUILD_RESULT.txt').write_text(report)
+          (out/'DEGISIKLIKLER.txt').write_text('FIX7 FINAL\n\n- Gercek 5-bit buton kodlari duzeltildi.\n- KISA artik A rolesi degildir.\n- BANK1 HORN horn_orig.h 8.021 ms kenar tablosudur.\n- BANK2 HORN bank2horn.h 17.211 ms kalin horn tablosudur.\n- Eski 50 kHz bit/DDS horn motoru kaldirildi.\n- WAWA/HILO yuzde 25 hizlandirildi.\n- A/B panel kapaliyken calismaz ve OFF ile kapanir.\n')
+          (out/'STVP_YUKLEME.txt').write_text('firmware_full.hex acin, Program > All tabs. Onceden Erase zorunlu degildir.\n')
+          (out/'SHA256SUMS.txt').write_text(f'{sha}  firmware_full.hex\n')
+          print(report)
+          PY
+
+      - name: Upload final firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: stm8-siren-fix7-final
+          path: deliverable
+          if-no-files-found: error
