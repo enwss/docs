@@ -1,0 +1,42 @@
+name: STM8 Fix7 Simple Build
+
+on:
+  push:
+    branches:
+      - ci-stm8-siren-fix7
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore source
+        run: |
+          mkdir -p project
+          base64 -d tmp_stm8_fix7/source_payload.b64 | tar -xz -C project
+
+      - name: Install SDCC
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sdcc
+
+      - name: Compile
+        run: |
+          mkdir -p build deliverable/STM8S103F3P6TR_firmware_full_fix7/src
+          cd build
+          sdcc -mstm8 --std-c99 --opt-code-size --max-allocs-per-node 10000 -DBUILD_VARIANT=3 -I../project/src -c ../project/src/main.c -o main.rel > compile.stdout.txt 2> compile.stderr.txt
+          sdcc -mstm8 --std-c99 --opt-code-size --max-allocs-per-node 10000 -DBUILD_VARIANT=3 -I../project/src -c ../project/src/audio.c -o audio.rel >> compile.stdout.txt 2>> compile.stderr.txt
+          sdcc -mstm8 --std-c99 --opt-code-size --max-allocs-per-node 10000 -DBUILD_VARIANT=3 -I../project/src -c ../project/src/profiles_data.c -o profiles_data.rel >> compile.stdout.txt 2>> compile.stderr.txt
+          sdcc -mstm8 --opt-code-size --code-loc 0x8000 --data-loc 0x0001 main.rel audio.rel profiles_data.rel -o firmware_full.hex >> compile.stdout.txt 2>> compile.stderr.txt
+          cp firmware_full.hex firmware_full.map compile.stdout.txt compile.stderr.txt ../deliverable/STM8S103F3P6TR_firmware_full_fix7/
+          cp ../project/src/* ../deliverable/STM8S103F3P6TR_firmware_full_fix7/src/
+          sdcc --version > ../deliverable/STM8S103F3P6TR_firmware_full_fix7/SDCC_VERSION.txt
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: stm8-fix7-simple
+          path: deliverable
+          if-no-files-found: error
