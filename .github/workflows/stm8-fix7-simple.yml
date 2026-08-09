@@ -1,4 +1,4 @@
-name: STM8 Fix7 Simple Build
+name: STM8 RF 5BIT Final Build
 
 on:
   push:
@@ -13,30 +13,147 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Restore source
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p project
           base64 -d tmp_stm8_fix7/source_payload.b64 | tar -xz -C project
 
       - name: Install SDCC
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y sdcc
+          sdcc --version
 
-      - name: Compile
+      - name: Compile and validate
+        shell: bash
         run: |
-          mkdir -p build deliverable/STM8S103F3P6TR_firmware_full_fix7/src
-          cd build
-          sdcc -mstm8 --std-c99 --opt-code-size --max-allocs-per-node 10000 -DBUILD_VARIANT=3 -I../project/src -c ../project/src/main.c -o main.rel > compile.stdout.txt 2> compile.stderr.txt
-          sdcc -mstm8 --std-c99 --opt-code-size --max-allocs-per-node 10000 -DBUILD_VARIANT=3 -I../project/src -c ../project/src/audio.c -o audio.rel >> compile.stdout.txt 2>> compile.stderr.txt
-          sdcc -mstm8 --std-c99 --opt-code-size --max-allocs-per-node 10000 -DBUILD_VARIANT=3 -I../project/src -c ../project/src/profiles_data.c -o profiles_data.rel >> compile.stdout.txt 2>> compile.stderr.txt
-          sdcc -mstm8 --opt-code-size --code-loc 0x8000 --data-loc 0x0001 main.rel audio.rel profiles_data.rel -o firmware_full.hex >> compile.stdout.txt 2>> compile.stderr.txt
-          cp firmware_full.hex firmware_full.map compile.stdout.txt compile.stderr.txt ../deliverable/STM8S103F3P6TR_firmware_full_fix7/
-          cp ../project/src/* ../deliverable/STM8S103F3P6TR_firmware_full_fix7/src/
-          sdcc --version > ../deliverable/STM8S103F3P6TR_firmware_full_fix7/SDCC_VERSION.txt
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/project"
+          BUILD="$GITHUB_WORKSPACE/build"
+          OUT="$GITHUB_WORKSPACE/deliverable/STM8S103F3P6TR_RF_5BIT"
+          mkdir -p "$BUILD" "$OUT/src" "$OUT/reference"
+          cd "$BUILD"
 
-      - name: Upload
+          CFLAGS="-mstm8 --std-c99 --opt-code-size --max-allocs-per-node 10000 -I$ROOT/src"
+          : > compile.stdout.txt
+          : > compile.stderr.txt
+          sdcc $CFLAGS -c "$ROOT/src/main.c" -o main.rel >>compile.stdout.txt 2>>compile.stderr.txt
+          sdcc -mstm8 --opt-code-size --code-loc 0x8000 --data-loc 0x0001 main.rel -o firmware_full.ihx >>compile.stdout.txt 2>>compile.stderr.txt
+          cp firmware_full.ihx firmware_full.hex
+          cp firmware_full.ihx firmware_full.hex firmware_full.map compile.stdout.txt compile.stderr.txt "$OUT/"
+          cp "$ROOT/src/main.c" "$ROOT/src/stm8s103_regs.h" "$OUT/src/"
+          cp "$ROOT/reference/RA4M1_RF_5BIT_REPLACEMENT.ino" "$OUT/reference/"
+          sdcc --version > "$OUT/SDCC_VERSION.txt" 2>&1
+          export OUT ROOT
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, os, re
+          out=Path(os.environ['OUT']); root=Path(os.environ['ROOT'])
+          hx=out/'firmware_full.hex'; mp=out/'firmware_full.map'; main=(root/'src/main.c').read_text()
+          mem={}; upper=0; eof=False; records=0
+          for lineno,line in enumerate(hx.read_text().splitlines(),1):
+              line=line.strip()
+              if not line: continue
+              if not line.startswith(':'): raise SystemExit(f'HEX colon error line {lineno}')
+              raw=bytes.fromhex(line[1:])
+              if sum(raw)&0xff: raise SystemExit(f'HEX checksum error line {lineno}')
+              n=raw[0]; addr=(raw[1]<<8)|raw[2]; typ=raw[3]; data=raw[4:4+n]; records+=1
+              if len(data)!=n: raise SystemExit(f'HEX length error line {lineno}')
+              if typ==0:
+                  for i,b in enumerate(data): mem[upper+addr+i]=b
+              elif typ==4: upper=int.from_bytes(data,'big')<<16
+              elif typ==1: eof=True; break
+          if not mem or not eof: raise SystemExit('HEX data/EOF missing')
+          lo=min(mem); hi=max(mem); span=hi-lo+1
+          if lo != 0x8000 or hi > 0x9fff: raise SystemExit(f'Flash range invalid 0x{lo:04X}-0x{hi:04X}')
+          if any(a < 0x8000 or a > 0x9fff for a in mem): raise SystemExit('Non-program-flash record present')
+
+          vectors={
+              'RESET':0x8000,
+              'EXTI_PORTD_IRQ6':0x8020,
+              'TIM4_IRQ23':0x8064,
+          }
+          vector_lines=[]
+          for name,addr in vectors.items():
+              b=[mem.get(addr+i) for i in range(4)]
+              if None in b or b[0] != 0x82: raise SystemExit(f'{name} vector opcode invalid')
+              target=(b[1]<<16)|(b[2]<<8)|b[3]
+              if not 0x8000 <= target <= hi: raise SystemExit(f'{name} target invalid 0x{target:06X}')
+              vector_lines.append(f'{name:18s}: 0x{addr:04X} -> 0x{target:06X} PASS')
+
+          expected={
+              0x12:0x12,0x02:0x02,0x03:0x06,0x1D:0x1D,0x07:0x07,0x1B:0x1E,
+              0x1C:0x19,0x19:0x1C,0x1A:0x1A,0x17:0x17,0x18:0x18,0x0B:0x0E,
+              0x06:0x03,0x11:0x14,0x05:0x05,0x16:0x13,0x09:0x0C,0x0A:0x0A,
+          }
+          for src,dst in expected.items():
+              pat=rf'case\s+0x{src:02X}U:\s*return\s+0x{dst:02X}U;'
+              if not re.search(pat,main,re.I): raise SystemExit(f'Command remap missing {src:02X}->{dst:02X}')
+          required=[
+              '#define RF_FRAME_TOKENS 43U','#define MAX_REMOTES     16U',
+              '#define RF_RELEASE_MS      45U','#define LED_BLINK_MS       400U',
+              '#define LEARN_TIMEOUT_MS   4000U','if (rfTokens[42] != TK_LS)',
+              'if ((a == TK_LM) && (b == TK_HS)) return 1;',
+              'if ((a == TK_LS) && (b == TK_HM)) return 0;',
+              'FLASH_DUKR = 0xAEU;','FLASH_DUKR = 0x56U;',
+          ]
+          for s in required:
+              if s not in main: raise SystemExit('Required behavior marker missing: '+s)
+
+          maptext=mp.read_text(errors='replace')
+          def area(name):
+              m=re.search(rf'^{re.escape(name)}\s+([0-9A-F]+)\s+([0-9A-F]+)\s+=\s+(\d+)\.',maptext,re.M)
+              return (int(m.group(1),16),int(m.group(2),16),int(m.group(3))) if m else (0,0,0)
+          data=area('DATA'); initialized=area('INITIALIZED'); sseg=area('SSEG')
+          static_ram=data[2]+initialized[2]+sseg[2]
+          flash_sha=hashlib.sha256(hx.read_bytes()).hexdigest()
+          source_sha=hashlib.sha256((root/'reference/RA4M1_RF_5BIT_REPLACEMENT.ino').read_bytes()).hexdigest()
+          stderr=(out/'compile.stderr.txt').read_text().strip()
+          report='\n'.join([
+              'STM8S103F3P6TR RF 5-BIT REPLACEMENT - REAL BUILD VALIDATION',
+              '',
+              'Build status       : PASS',
+              'Compiler stderr    : '+('EMPTY' if not stderr else 'SEE compile.stderr.txt'),
+              f'Flash start        : 0x{lo:04X}',
+              f'Flash end          : 0x{hi:04X}',
+              f'Flash span/used    : {span} bytes / 8192 bytes',
+              f'Flash free         : {8192-span} bytes',
+              f'HEX programmed bytes: {len(mem)}',
+              f'Linker RAM segments: {static_ram} bytes / 1024 bytes',
+              f'RAM remaining      : {1024-static_ram} bytes (runtime stack included in this remainder)',
+              f'DATA                : {data[2]} bytes @ 0x{data[0]:04X}',
+              f'INITIALIZED         : {initialized[2]} bytes @ 0x{initialized[0]:04X}',
+              f'SSEG marker         : {sseg[2]} bytes @ 0x{sseg[0]:04X}',
+              '', *vector_lines,
+              '',
+              'HEX checksum/EOF   : PASS',
+              'Program flash range: PASS (0x8000..0x9FFF only)',
+              'EEPROM in HEX      : NO (runtime DATA EEPROM only)',
+              'Command remap table: PASS (18 entries)',
+              '43-token markers   : PASS',
+              'Legacy pair decode : PASS',
+              f'HEX records         : {records}',
+              f'HEX SHA-256         : {flash_sha}',
+              f'Reference INO SHA256: {source_sha}',
+              '',
+          ])
+          (out/'BUILD_VALIDATION.txt').write_text(report)
+          (out/'firmware_full.mem').write_text(report)
+          (out/'SHA256SUMS.txt').write_text(
+              f'{flash_sha}  firmware_full.hex\n'+
+              f'{hashlib.sha256((out/"firmware_full.ihx").read_bytes()).hexdigest()}  firmware_full.ihx\n'+
+              f'{source_sha}  reference/RA4M1_RF_5BIT_REPLACEMENT.ino\n'
+          )
+          print(report)
+          PY
+
+      - name: Upload final firmware
         uses: actions/upload-artifact@v4
         with:
-          name: stm8-fix7-simple
+          name: stm8-rf-5bit-final
           path: deliverable
           if-no-files-found: error
